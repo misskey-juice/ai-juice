@@ -373,7 +373,9 @@ export default {
 
 	maze: {
 		post: (timeOfDay: string, difficulty: string) => `${timeOfDay}の迷路です！ 難易度: ${difficulty} #AiMaze`,
-		foryou: '描きました！'
+		foryou: '描きました！',
+		// 藍本気の迷路は細かい模様になるので、本文ごと集合体注意のCWに入れる
+		trypophobiaCw: (text: string) => `【集合体注意】${text}`
 	},
 
 	chart: {

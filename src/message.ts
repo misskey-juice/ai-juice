@@ -80,7 +80,8 @@ export default class Message {
 		immediate?: boolean;
 		isAIGenerated?: boolean;
 	}) {
-		if (text == null) return;
+		// CWだけの返信(本文をCWに入れた場合)も送れるようにする
+		if (text == null && opts?.cw == null) return;
 
 		this.ai.log(`>>> Sending reply to ${chalk.underline(this.id)}`);
 
@@ -89,8 +90,9 @@ export default class Message {
 		}
 
 		if (this.chatMessage) {
+			// チャットにはCWが無いので、CWに入れた本文をそのまま送る
 			return await this.ai.sendMessage(this.chatMessage.fromUserId, {
-				text: text,
+				text: text ?? opts?.cw,
 				fileId: opts?.file?.id
 			});
 		} else {

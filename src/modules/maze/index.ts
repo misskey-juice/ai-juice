@@ -51,8 +51,9 @@ export default class extends Module {
 		const file = await this.genMazeFile(key, difficulty.key);
 
 		this.log('Posting...');
+		const text = serifs.maze.post(slot.label, difficulty.label);
 		this.ai.post({
-			text: serifs.maze.post(slot.label, difficulty.label),
+			...(difficulty.key === 'ai' ? { cw: serifs.maze.trypophobiaCw(text) } : { text }),
 			fileIds: [file.id]
 		});
 	}
@@ -87,7 +88,11 @@ export default class extends Module {
 			setTimeout(async () => {
 				const file = await this.genMazeFile(Date.now(), size);
 				this.log('Replying...');
-				msg.reply(serifs.maze.foryou, { file });
+				if (size === 'ai') {
+					msg.reply(null, { file, cw: serifs.maze.trypophobiaCw(serifs.maze.foryou) });
+				} else {
+					msg.reply(serifs.maze.foryou, { file });
+				}
 			}, 3000);
 			return {
 				reaction: 'like'
