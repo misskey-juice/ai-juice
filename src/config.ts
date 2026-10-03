@@ -18,6 +18,7 @@ type Config = {
 	openaiApiUrl?: string;
 	openaiModel?: string;
 	openaiReasoningEffort?: string;
+	kagiApiKey?: string;
 	prompt?: string;
 	aichatRandomTalkEnabled?: boolean;
 	aichatRandomTalkProbability?: string;
