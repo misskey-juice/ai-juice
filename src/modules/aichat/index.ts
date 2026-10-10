@@ -68,6 +68,14 @@ type OpenAiMessage = {
 	tool_call_id?: string;
 };
 
+// Claude(Anthropic Messages API)のコンテンツブロック。思考(thinking)ブロックはツールの往復でそのまま返す必要があるため、
+// 受け取ったものは中身を触らずに保持できるよう緩い型にしている
+type ClaudeContentBlock = { type: string; [key: string]: unknown };
+type ClaudeMessage = {
+	role: 'user' | 'assistant';
+	content: string | ClaudeContentBlock[];
+};
+
 type AiChatHist = {
 	postId: string;
 	createdAt: number;
@@ -104,6 +112,7 @@ const GEMINI_PRO = 'gemini-pro';
 const GEMINI_FLASH = 'gemini-flash';
 const TYPE_PLAMO = 'plamo';
 const TYPE_OPENAI = 'openai';
+const TYPE_CLAUDE = 'claude';
 const GROUNDING_TARGET = 'ggg';
 
 const GEMINI_20_FLASH_API = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
@@ -113,12 +122,25 @@ const PLAMO_API = 'https://platform.preferredai.jp/api/completion/v1/chat/comple
 const PLAMO_MODEL = 'plamo-beta';
 const OPENAI_DEFAULT_API = 'https://api.openai.com/v1/chat/completions';
 const OPENAI_DEFAULT_MODEL = 'gpt-4o-mini';
+const CLAUDE_DEFAULT_API = 'https://api.anthropic.com/v1/messages';
+const CLAUDE_DEFAULT_MODEL = 'claude-opus-5-5';
+const CLAUDE_DEFAULT_EFFORT = 'medium';
+const CLAUDE_API_VERSION = '2023-06-01';
+// 出力トークンの上限。思考(adaptive thinking)の分もここに含まれるため、返答(2800文字以内)より十分大きくしておく
+const CLAUDE_MAX_TOKENS = 16000;
+// Claudeが画像として受け付ける形式
+const CLAUDE_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 
-// ログにAPIキーを残さないよう、Authorizationヘッダーと?key=を伏せ字にしてからJSON化する
+// ログにAPIキーを残さないよう、Authorization・x-api-keyヘッダーと?key=を伏せ字にしてからJSON化する
 function stringifyRequestForLog(options: { headers?: Record<string, string>; searchParams?: Record<string, string> }): string {
+	const headers = options.headers == null ? undefined : {
+		...options.headers,
+		...(options.headers.Authorization != null ? { Authorization: '***' } : {}),
+		...(options.headers['x-api-key'] != null ? { 'x-api-key': '***' } : {}),
+	};
 	return JSON.stringify({
 		...options,
-		...(options.headers?.Authorization != null ? { headers: { ...options.headers, Authorization: '***' } } : {}),
+		...(headers != null ? { headers } : {}),
 		...(options.searchParams?.key != null ? { searchParams: { ...options.searchParams, key: '***' } } : {}),
 	});
 }
@@ -396,9 +418,9 @@ export default class extends Module {
 		return null;
 	}
 
+	// OpenAI互換APIとClaudeで共通のシステムプロンプト(日時・会話相手・カスタム絵文字・URLの情報)を組み立てる
 	@bindThis
-	private async genTextByOpenAI(aiChat: AiChat, files: base64File[]) {
-		this.log('Generate Text By OpenAI-compatible API...');
+	private async buildSystemPrompt(aiChat: AiChat): Promise<string> {
 		const now = new Date().toLocaleString('ja-JP', {
 			timeZone: 'Asia/Tokyo',
 			year: 'numeric',
@@ -453,6 +475,13 @@ export default class extends Module {
 				}
 			}
 		}
+		return systemPrompt;
+	}
+
+	@bindThis
+	private async genTextByOpenAI(aiChat: AiChat, files: base64File[]) {
+		this.log('Generate Text By OpenAI-compatible API...');
+		const systemPrompt = await this.buildSystemPrompt(aiChat);
 
 		let messages: OpenAiMessage[] = [{ role: 'system', content: systemPrompt }];
 		if (aiChat.history != null) {
@@ -556,6 +585,129 @@ export default class extends Module {
 				const toolResultText = await callMcpTool(toolCall.function.name, args);
 				messages.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResultText });
 			}
+		}
+		return null;
+	}
+
+	@bindThis
+	private async genTextByClaude(aiChat: AiChat, files: base64File[]) {
+		this.log('Generate Text By Claude...');
+		const system = await this.buildSystemPrompt(aiChat);
+		const model = config.claudeModel ?? CLAUDE_DEFAULT_MODEL;
+		const effort = config.claudeEffort ?? CLAUDE_DEFAULT_EFFORT;
+
+		// 会話履歴(Geminiの'model'ロールはClaudeでは'assistant')。同じロールが続いてもAPI側で1つにまとめられる
+		const messages: ClaudeMessage[] = [];
+		if (aiChat.history != null) {
+			aiChat.history.forEach(entry => {
+				messages.push({
+					role: entry.role === 'model' || entry.role === 'assistant' ? 'assistant' : 'user',
+					content: entry.content,
+				});
+			});
+		}
+
+		// 画像はbase64のまま添付する(Claudeが受け付けない形式は除く)
+		const imageBlocks: ClaudeContentBlock[] = files
+			.filter(file => CLAUDE_IMAGE_TYPES.includes(file.type))
+			.map(file => ({
+				type: 'image',
+				source: { type: 'base64', media_type: file.type, data: file.base64 },
+			}));
+		messages.push({
+			role: 'user',
+			content: [...imageBlocks, { type: 'text', text: aiChat.question }],
+		});
+
+		// MCPのツールをClaudeのツール定義に変換する
+		const tools = (await listOpenAiTools()).map(tool => ({
+			name: tool.function.name,
+			description: tool.function.description,
+			input_schema: tool.function.parameters,
+		}));
+		if (tools.length > 0) {
+			this.log(`MCP tools available: ${tools.map(t => t.name).join(', ')}`);
+		}
+
+		// Claudeへのリクエストを1回投げる。gotのretryを使い切ってもなお失敗した場合はnullを返す
+		// toolMode: 'auto'はツールを使える、'none'はツール定義は渡すが呼ばせない(履歴にtool_useがあるときはツール定義が要る)、'off'はツールを渡さない
+		const requestOnce = async (toolMode: 'auto' | 'none' | 'off'): Promise<any> => {
+			const options = {
+				url: aiChat.api,
+				headers: {
+					'x-api-key': aiChat.key,
+					'anthropic-version': CLAUDE_API_VERSION,
+				},
+				json: {
+					model: model,
+					max_tokens: CLAUDE_MAX_TOKENS,
+					system: system,
+					messages: messages,
+					output_config: { effort: effort },
+					...(toolMode !== 'off' && tools.length > 0 ? { tools: tools } : {}),
+					...(toolMode === 'none' && tools.length > 0 ? { tool_choice: { type: 'none' } } : {}),
+				},
+				// 思考を含むため返答に時間がかかることがある
+				timeout: { request: 1000 * 60 * 3 },
+				// POSTはgot既定では自動リトライされないため明示的に有効化。529はAnthropicの混雑時の応答
+				retry: { limit: 2, methods: ['POST' as const], statusCodes: [408, 429, 500, 502, 503, 504, 529] },
+			};
+			this.log(stringifyRequestForLog(options));
+			try {
+				const res_data = await got.post(options,
+					{parseJson: (res: string) => JSON.parse(res)}).json();
+				this.log(JSON.stringify(res_data));
+				return res_data;
+			} catch (err: unknown) {
+				this.log('Error By Call Claude API');
+				if (err instanceof Error) {
+					this.log(`${err.name}\n${err.message}\n${err.stack}`);
+				}
+				if (err instanceof HTTPError) {
+					this.log(`Response body: ${String(err.response.body).slice(0, 2000)}`);
+				}
+				return null;
+			}
+		};
+
+		// ツール呼び出しのラウンドトリップ上限。無限ループ防止用
+		const MAX_TOOL_ROUNDS = 5;
+		let usedTools = false;
+		for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+			const isLastRound = round === MAX_TOOL_ROUNDS;
+
+			let res_data = await requestOnce(isLastRound ? 'none' : 'auto');
+			if (res_data == null && !usedTools) {
+				// gotのretryを使い切ってもなお失敗した場合、ツール指定を外したシンプルな形で最後にもう一度だけ試す
+				this.log('Retrying once without tool definitions as a fallback...');
+				res_data = await requestOnce('off');
+			}
+			if (res_data == null) return null;
+
+			const content: ClaudeContentBlock[] = Array.isArray(res_data.content) ? res_data.content : [];
+			const toolUses = content.filter(block => block.type === 'tool_use');
+			if (res_data.stop_reason !== 'tool_use' || toolUses.length === 0) {
+				const text = content
+					.filter(block => block.type === 'text' && typeof block.text === 'string')
+					.map(block => block.text as string)
+					.join('');
+				return text.length > 0 ? text : null;
+			}
+
+			// 思考ブロックも含め、アシスタントの返答はそのまま履歴に積む(並べ替えや削除をするとAPIがエラーを返す)
+			messages.push({ role: 'assistant', content: content });
+			usedTools = true;
+
+			// 各ツールを実行し、結果をtool_resultとしてまとめて返す
+			const results: ClaudeContentBlock[] = [];
+			for (const toolUse of toolUses) {
+				const name = String(toolUse.name);
+				const input = (toolUse.input ?? {}) as Record<string, unknown>;
+				this.log(`MCP tool call: ${name}(${JSON.stringify(input)})`);
+				const toolResultText = await callMcpTool(name, input);
+				results.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResultText });
+			}
+			messages.push({ role: 'user', content: results });
 		}
 		return null;
 	}
@@ -710,6 +862,8 @@ export default class extends Module {
 			type = TYPE_OPENAI;
 		} else if (msg.includes([KIGO + TYPE_PLAMO])) {
 			type = TYPE_PLAMO;
+		} else if (msg.includes([KIGO + TYPE_CLAUDE])) {
+			type = TYPE_CLAUDE;
 		}
 		const current : AiChatHist = {
 			postId: msg.id,
@@ -1050,6 +1204,31 @@ export default class extends Module {
 				};
 				aiChat.prompt += this.describeSelfModel(config.openaiModel ?? OPENAI_DEFAULT_MODEL, config.openaiReasoningEffort ?? null);
 				text = await this.genTextByOpenAI(aiChat, openaiFiles);
+				break;
+
+			case TYPE_CLAUDE:
+				// Claudeの場合、APIキーが必須
+				if (!config.claudeApiKey) {
+					msg.reply(serifs.aichat.nothing(exist.type));
+					return false;
+				}
+				// チャット(DM)の添付ファイルは今のところ未対応(ノートの添付のみ画像として渡す)
+				const claudeNoteFiles: base64File[] = msg.isChat ? [] : await this.note2base64File(msg.id);
+				// 本文中のカスタム絵文字ショートコードを画像として解決し、添付ファイルに加える
+				const claudeEmojis = await this.resolveEmojiImages(question);
+				const claudeFiles: base64File[] = [...claudeNoteFiles, ...claudeEmojis.map(e => e.file)];
+				aiChat = {
+					question: question,
+					prompt: prompt,
+					api: config.claudeApiUrl ?? CLAUDE_DEFAULT_API,
+					key: config.claudeApiKey,
+					history: exist.history,
+					friendName: friendName,
+					fromMention: exist.fromMention,
+					emojiNames: claudeEmojis.map(e => e.name),
+				};
+				aiChat.prompt += this.describeSelfModel(config.claudeModel ?? CLAUDE_DEFAULT_MODEL, config.claudeEffort ?? CLAUDE_DEFAULT_EFFORT);
+				text = await this.genTextByClaude(aiChat, claudeFiles);
 				break;
 
 			default:

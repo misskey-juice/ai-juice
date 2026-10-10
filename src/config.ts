@@ -18,6 +18,10 @@ type Config = {
 	openaiApiUrl?: string;
 	openaiModel?: string;
 	openaiReasoningEffort?: string;
+	claudeApiKey?: string;
+	claudeApiUrl?: string;
+	claudeModel?: string;
+	claudeEffort?: string;
 	kagiApiKey?: string;
 	prompt?: string;
 	aichatRandomTalkEnabled?: boolean;
